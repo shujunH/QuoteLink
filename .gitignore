@@ -1,0 +1,9 @@
+backend/.venv/
+__pycache__/
+*.py[cod]
+*.sqlite3*
+backend/.local-secret
+.env
+node_modules/
+dist/
+*.log

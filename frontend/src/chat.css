@@ -1,0 +1,78 @@
+/* 聊天记录独立滚动，条件和输入框固定在同一窗口的上下两端。 */
+.chat-window {
+  height: calc(100dvh - 118px);
+  min-height: 490px;
+  max-width: 1180px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #d4dfd6;
+  border-radius: 16px;
+  background: white;
+  box-shadow: 0 5px 25px #1d49330a;
+}
+.chat-heading {
+  flex: none; position: relative; isolation: isolate; overflow: hidden;
+  display: flex; align-items: center; min-height: 90px; padding: 18px 28px;
+  background: linear-gradient(105deg, #104c39, #235f46); color: #fff;
+}
+.chat-heading h1 { font-size: clamp(21px,2vw,29px); line-height: 1.3; }
+.chat-heading p { margin-top: 6px; color: #d4e6d8; font-size: 12px; }
+.chat-heading .hero-art { width: 240px; right: 12px; }
+.need-strip { display: flex; flex: none; flex-wrap: wrap; gap: 8px 20px; padding: 12px 28px; background: #f8faf5; border-bottom: 1px solid #e2e8df; }
+.need-strip span { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #64756a; }
+.need-strip b { font-weight: 550; color: #3b5444; overflow-wrap: anywhere; }
+.chat-log { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: #c3d0c4 transparent; }
+.chat-log:focus-visible { outline: 2px solid #81a88a; outline-offset: -2px; }
+.chat-welcome { min-height: 100%; padding: 28px 20px; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; }
+.assistant-mark,.speaker span { display: inline-grid; place-items: center; background: #e7f1dc; color: #3b6c44; border-radius: 9px; }
+.assistant-mark { width: 45px; height: 45px; margin-bottom: 13px; }
+.chat-welcome h2 { font-size: 22px; }
+.chat-welcome p { color: var(--muted); font-size: 13px; line-height: 1.7; margin-top: 8px; }
+.starter-list { display: flex; justify-content: center; flex-wrap: wrap; gap: 8px; margin-top: 19px; }
+.starter-list button,.trace-toggle { display: inline-flex; align-items: center; gap: 8px; }
+.starter-list button { border: 1px solid #d8e3d5; border-radius: 8px; background: #fafcf7; padding: 9px 12px; color: #3a5a45; font-size: 12px; }
+.starter-list button:hover { background: #edf4e7; border-color: #a4bea7; }
+.turn-list { max-width: 910px; margin: auto; padding: 18px 26px 22px; }
+.turn + .turn { margin-top: 26px; padding-top: 20px; border-top: 1px solid #e8ede6; }
+.user-bubble { width: fit-content; max-width: 87%; margin-left: auto; padding: 10px 14px; background: #e5f0e1; color: #234832; border-radius: 14px 14px 3px 14px; font-size: 14px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.speaker { display: flex; align-items: center; gap: 7px; margin: 18px 0 8px; color: #44634e; font-size: 13px; }
+.speaker span { width: 24px; height: 24px; border-radius: 7px; }.speaker small { color: #758679; font-size: 11px; }
+.assistant-text { font-size: 14px; line-height: 1.8; overflow-wrap: anywhere; white-space: pre-wrap; }
+.quote-result { margin-top: 12px; border: 1px solid #dbe5d9; border-radius: 10px; overflow: hidden; }
+.result-heading,.offer-top,.best-label { display: flex; align-items: center; gap: 7px; }
+.result-heading { padding: 10px 13px; background: #eef4ea; color: #3c6046; }
+.result-heading h3,.offer-top { font-size: 14px; }
+.result-heading small { margin-left: auto; font-size: 11px; }
+.offer,.result-action { padding: 10px 13px; border-top: 1px solid #e2e9df; }
+.offer.recommended { background: #f6faf2; }
+.offer-top { flex-wrap: wrap; }.offer-top strong { margin-left: auto; font-variant-numeric: tabular-nums; }.offer-top code { font-size: 11px; color: var(--muted); }
+.best-label { gap: 1px; border-radius: 4px; padding: 2px 5px; background: #dcecd3; font-size: 10px; color: #325e3a; }
+.offer p,.offer small,.inline-draft p { font-size: 12px; line-height: 1.65; }.offer p,.inline-draft p { margin-top: 4px; color: var(--muted); }.offer small { color: #85572e; }.offer .pass { color: #46724b; }
+.inline-draft { border-left: 2px solid #a5c49e; padding-left: 10px; margin-top: 10px; font-size: 13px; }
+.trace-toggle { border: 0; background: transparent; color: #657a6a; padding: 9px 0 0; font-size: 12px; }
+.trace-toggle svg { transition: transform .18s ease; }.trace-toggle .flipped { transform: rotate(180deg); }
+.chat-footer { padding: 12px clamp(14px,3vw,38px) 16px; border-top: 1px solid var(--border); background: #fafcf8; flex: none; }
+.chat-footer form,.chat-footer .examples,.chat-footer .error { max-width: 860px; margin-inline: auto; }
+.chat-footer .examples { margin-top: 0; margin-bottom: 8px; }.chat-footer .input-wrap { background: #fff; padding: 8px 11px; }
+.chat-footer textarea { min-height: 40px; max-height: 92px; resize: none; display: block; }
+.sidebar-history { min-height: 0; overflow-y: auto; scrollbar-width: thin; margin: 22px 2px 16px; padding-top: 15px; border-top: 1px solid var(--border); }
+.history-title { display: flex; align-items: center; gap: 8px; padding: 0 10px 9px; color: #64776a; font-size: 12px; }
+.sidebar-history .muted { padding-left: 10px; }.sidebar-history .history-link { padding: 9px 10px; border: 0; border-radius: 7px; }.history-link.chosen { background: #edf3e8; color: var(--green); }
+
+/* 按下按钮、翻页、展开明细和收到回复时提供渐进反馈。 */
+button,a.btn,.input-wrap { transition: background-color .18s, border-color .18s, color .18s, box-shadow .18s, opacity .18s, transform .14s; }
+button:active:not(:disabled),a.btn:active { transform: translateY(1px) scale(.98); }
+.page-enter-active,.page-leave-active,.soft-enter-active,.soft-leave-active,.fade-enter-active,.fade-leave-active { transition: opacity .18s ease, transform .18s ease; }
+.page-enter-from,.soft-enter-from { opacity: 0; transform: translateY(6px); }
+.page-leave-to,.soft-leave-to { opacity: 0; transform: translateY(-3px); }
+.fade-enter-from,.fade-leave-to { opacity: 0; }
+.turn:last-child,.chat-welcome { animation: chat-arrive .24s ease-out both; }
+@keyframes chat-arrive { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
+@media(max-width:680px) {
+  .chat-window { height: calc(100dvh - 80px); min-height: 390px; }
+  .chat-heading { padding: 13px 15px; min-height: 72px; }.chat-heading p { max-width: 78%; font-size: 11px; }
+  .chat-heading .hero-art { width: 90px; right: -6px; }.need-strip { padding: 8px 13px; gap: 5px 12px; }.need-strip span { font-size: 11px; }
+  .turn-list { padding: 14px 12px; }.chat-footer { padding: 9px; }.user-bubble { max-width: 92%; }
+}
