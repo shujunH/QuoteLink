@@ -155,7 +155,7 @@ class WorkflowTests(TestCase):
         quote = self.sample()
         Quote.objects.filter(code="QT-1002").update(freight="999.00")
         responses = ["运费成本是运输商品产生的费用。", "按用途可分为直接采购和间接采购。",
-                     [("list_products", {})], [("read_comparison", {})],
+                     [("list_products", {})], "目前有有效报价的商品有：显示器。", [("read_comparison", {})],
                      "上次比价中，青禾数码的整单运费为 300 元。"]
         with simulated_provider(responses) as (base, calls), patch.dict("os.environ", {
             "QUOTELINK_API_KEY": "local-test", "QUOTELINK_MODEL": "fixture", "QUOTELINK_BASE_URL": base
@@ -206,7 +206,8 @@ class WorkflowTests(TestCase):
         self.assertEqual(initial_payload["quotes"][0]["unit_price"], "25.50")
         self.assertEqual(latest_payload["quotes"][0]["unit_price"], "26.00")
         self.assertEqual(refreshed["turns"][-1]["trace"][0]["tool"], "query_quotes")
-        self.assertNotIn("tools", calls[1])
+        self.assertEqual({t["function"]["name"] for t in calls[1]["tools"]},
+                         {"list_products", "read_comparison", "query_quotes"})
         self.assertEqual(self.confirm(refreshed).status_code, 201)
 
     def test_model_supplier_query_without_procurement_conditions(self):
@@ -242,6 +243,109 @@ class WorkflowTests(TestCase):
             "QUOTELINK_API_KEY": "local-test", "QUOTELINK_MODEL": "fixture", "QUOTELINK_BASE_URL": base
         }):
             response = self.ask("青禾数码有哪些报价？")
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(Inquiry.objects.exists())
+
+    def test_model_reads_catalog_then_all_77_quotes_across_pages(self):
+        # 真实客户端连续读取目录和两页报价，确保 19 种商品的 77 条结果无遗漏。
+        inquiry = self.sample()
+        Quote.objects.bulk_create([
+            Quote(code=f"BULK-{i:03d}", supplier=f"演示供货商{i % 4}",
+                  product=f"商品{i // 4:02d}" if i < 72 else "显示器",
+                  unit_price=str(10 + i) if i < 72 else "5000", freight="10", stock=100, lead_days=2)
+            for i in range(74)
+        ])
+        responses = [[("list_products", {})], [("query_quotes", {"all_products": True, "limit": 50})],
+                     [("query_quotes", {"all_products": True, "limit": 50, "offset": 50})],
+                     "已读取19种商品的全部77条有效报价，下面按商品列出供应商和单价。"]
+        with simulated_provider(responses) as (base, calls), patch.dict("os.environ", {
+            "QUOTELINK_API_KEY": "local-test", "QUOTELINK_MODEL": "fixture", "QUOTELINK_BASE_URL": base
+        }):
+            response = self.ask("我要所有产品的名称和对应报价", inquiry)
+        self.assertEqual(response.status_code, 200, response.content)
+        item = response.json()
+        self.assertEqual(item["needs"], inquiry["needs"])
+        self.assertEqual(item["comparison_revision"], inquiry["comparison_revision"])
+        self.assertEqual(item["turns"][-1]["kind"], "answer")
+        self.assertFalse(item["turns"][-1]["rows"])
+        self.assertEqual([t["tool"] for t in item["turns"][-1]["trace"]],
+                         ["list_products", "query_quotes", "query_quotes"])
+        catalog = json.loads(calls[1]["messages"][-1]["content"])
+        first = json.loads(calls[2]["messages"][-1]["content"])
+        last = json.loads(calls[3]["messages"][-1]["content"])
+        self.assertEqual(len(catalog), 19)
+        self.assertEqual(first["query"], {"all_products": True})
+        self.assertEqual((first["total"], len(first["quotes"]), first["next_offset"]), (77, 50, 50))
+        self.assertEqual((last["total"], len(last["quotes"]), last["next_offset"]), (77, 27, None))
+        self.assertEqual({q["code"] for q in first["quotes"] + last["quotes"]},
+                         set(Quote.objects.values_list("code", flat=True)))
+        self.assertEqual(self.confirm(item).status_code, 201)
+
+    def test_model_batches_multiple_read_only_queries(self):
+        inquiry = self.sample()
+        Quote.objects.create(code="PAPER-01", supplier="演示纸业", product="A4打印纸",
+                             unit_price="25.50", freight="30", stock=60, lead_days=2)
+        responses = [[("query_quotes", {"product": "显示器"}),
+                      ("query_quotes", {"product": "A4打印纸"}), ("read_comparison", {})],
+                     "显示器与A4打印纸当前报价已分别列出，历史显示器推荐仍为青禾数码。"]
+        with simulated_provider(responses) as (base, calls), patch.dict("os.environ", {
+            "QUOTELINK_API_KEY": "local-test", "QUOTELINK_MODEL": "fixture", "QUOTELINK_BASE_URL": base
+        }):
+            response = self.ask("同时查看显示器和A4打印纸的报价，并解释刚才的推荐", inquiry)
+        self.assertEqual(response.status_code, 200, response.content)
+        item = response.json()
+        tool_messages = calls[1]["messages"][-3:]
+        self.assertTrue(all(m["role"] == "tool" for m in tool_messages))
+        self.assertEqual([m["tool_call_id"] for m in tool_messages], ["call-1-0", "call-1-1", "call-1-2"])
+        self.assertEqual(json.loads(tool_messages[0]["content"])["total"], 3)
+        self.assertEqual(json.loads(tool_messages[1]["content"])["total"], 1)
+        self.assertEqual(json.loads(tool_messages[2]["content"])["recommended"], "QT-1002")
+        self.assertEqual(item["needs"], inquiry["needs"])
+        self.assertEqual(self.confirm(item).status_code, 201)
+
+    def test_model_rejects_mixed_read_and_procurement_batches_before_execution(self):
+        actions = [("query_quotes", {"all_products": True}), ("find_quotes", {"product": "显示器"})]
+        for batch in (actions, list(reversed(actions))):
+            with self.subTest(batch=batch), simulated_provider([batch]) as (base, _), patch.dict("os.environ", {
+                "QUOTELINK_API_KEY": "local-test", "QUOTELINK_MODEL": "fixture", "QUOTELINK_BASE_URL": base
+            }), patch("procurement.agent.query_quotes") as query:
+                response = self.ask("查看所有报价并发起显示器采购")
+                query.assert_not_called()
+            self.assertEqual(response.status_code, 503)
+            self.assertFalse(Inquiry.objects.exists())
+
+    def test_model_cannot_switch_from_read_only_to_procurement(self):
+        responses = [[("query_quotes", {"all_products": True})], [("find_quotes", {"product": "显示器"})]]
+        with simulated_provider(responses) as (base, calls), patch.dict("os.environ", {
+            "QUOTELINK_API_KEY": "local-test", "QUOTELINK_MODEL": "fixture", "QUOTELINK_BASE_URL": base
+        }):
+            response = self.ask("列出所有产品和报价")
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("find_quotes", {t["function"]["name"] for t in calls[1]["tools"]})
+        self.assertFalse(Inquiry.objects.exists())
+
+    def test_read_round_limit_summarizes_only_loaded_pages(self):
+        # 模型反复查询时有明确上限，最后禁用工具并说明尚未读取的分页。
+        responses = [[("query_quotes", {"all_products": True, "limit": 1})] for _ in range(8)]
+        responses.append("当前只读取了部分报价，尚未列全，可以继续查询后续分页。")
+        with simulated_provider(responses) as (base, calls), patch.dict("os.environ", {
+            "QUOTELINK_API_KEY": "local-test", "QUOTELINK_MODEL": "fixture", "QUOTELINK_BASE_URL": base
+        }):
+            response = self.ask("列出所有产品和报价")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(len(calls), 9)
+        self.assertNotIn("tools", calls[-1])
+        self.assertIn("未读取全部报价", calls[-1]["messages"][-1]["content"])
+        self.assertEqual(len(response.json()["turns"][-1]["trace"]), 8)
+        self.assertIn("尚未列全", response.json()["turns"][-1]["message"])
+
+    def test_read_tool_call_budget_rejects_excessive_batch(self):
+        responses = [[("query_quotes", {"all_products": True}) for _ in range(33)]]
+        with simulated_provider(responses) as (base, _), patch.dict("os.environ", {
+            "QUOTELINK_API_KEY": "local-test", "QUOTELINK_MODEL": "fixture", "QUOTELINK_BASE_URL": base
+        }), patch("procurement.agent.query_quotes") as query:
+            response = self.ask("列出所有产品和报价")
+            query.assert_not_called()
         self.assertEqual(response.status_code, 503)
         self.assertFalse(Inquiry.objects.exists())
 
@@ -291,9 +395,30 @@ class QuoteQueryTests(TestCase):
 
     def test_query_rejects_empty_filters_and_unbounded_results(self):
         for args in ({}, {"product": " "}, {"supplier": "甲", "limit": 51},
-                     {"code": "PAPER-01", "offset": -1}, {"code": "PAPER-01", "limit": True}):
+                     {"code": "PAPER-01", "offset": -1}, {"code": "PAPER-01", "limit": True},
+                     {"all_products": 1}, {"all_products": True, "product": "A4打印纸"}):
             with self.subTest(args=args), self.assertRaises(InputError):
                 query_quotes(**args)
+
+    def test_all_products_mode_is_paginated_and_excludes_inactive_quotes(self):
+        first = query_quotes(all_products=True, limit=2)
+        second = query_quotes(all_products=True, limit=2, offset=first["next_offset"])
+        rows = first["quotes"] + second["quotes"]
+        self.assertEqual(first["query"], {"all_products": True})
+        self.assertEqual(first["total"], 4)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(len({q["code"] for q in rows}), 4)
+        self.assertEqual({q["product"] for q in rows}, {"A4打印纸", "A3打印纸"})
+        self.assertNotIn("OFF-01", {q["code"] for q in rows})
+        self.assertIsNone(second["next_offset"])
+
+    def test_all_products_mode_handles_empty_catalog(self):
+        Quote.objects.update(active=False)
+        result = query_quotes(all_products=True)
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["total"], 0)
+        self.assertFalse(result["quotes"])
+        self.assertIsNone(result["next_offset"])
 
 
 @contextmanager

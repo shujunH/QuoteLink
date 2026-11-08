@@ -58,22 +58,25 @@ def quote_data(quote, today):
             "arrival": (today + timedelta(days=quote.lead_days)).isoformat()}
 
 
-def query_quotes(*, product=None, supplier=None, code=None, limit=20, offset=0, today=None):
-    """只读查询当前有效报价；规范品名空格和大小写，歧义品名先澄清，结果分页返回。"""
+def query_quotes(*, product=None, supplier=None, code=None, all_products=False, limit=20, offset=0, today=None):
+    """只读查询当前有效报价；显式支持全库分页，具体品名匹配有歧义时先澄清。"""
     filters = {}
     for name, value, size in (("product", product, 80), ("supplier", supplier, 80), ("code", code, 32)):
         if value is not None:
             if not isinstance(value, str) or not 0 < len(value.strip()) <= size:
                 raise InputError("查询条件须为有效的品名、供应商或报价编号。")
             filters[name] = value.strip()
-    if not filters:
-        raise InputError("请提供要查询的品名、供应商或报价编号。")
+    if type(all_products) is not bool or (all_products and filters):
+        raise InputError("查看全部商品时请使用全部报价模式，不要同时指定筛选条件。")
+    if not filters and not all_products:
+        raise InputError("请提供品名、供应商或报价编号，或明确选择查询全部商品。")
     if (type(limit) is not int or not 1 <= limit <= 50
             or type(offset) is not int or not 0 <= offset <= 1000000):
         raise InputError("每次可查询 1 至 50 条报价，起始位置须为有效的非负整数。")
 
     today = today or timezone.localdate()
-    result = {"query": filters, "queried_at": timezone.now().isoformat(), "quotes": [],
+    result = {"query": {"all_products": True} if all_products else filters,
+              "queried_at": timezone.now().isoformat(), "quotes": [],
               "total": 0, "limit": limit, "offset": offset, "next_offset": None}
     quotes = Quote.objects.filter(active=True)
     if "product" in filters:
