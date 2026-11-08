@@ -1,5 +1,7 @@
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
+import re
+import unicodedata
 
 from django.utils import timezone
 from .models import Quote
@@ -54,6 +56,46 @@ def quote_data(quote, today):
             "unit_price": str(quote.unit_price), "freight": str(quote.freight),
             "stock": quote.stock, "lead_days": quote.lead_days,
             "arrival": (today + timedelta(days=quote.lead_days)).isoformat()}
+
+
+def query_quotes(*, product=None, supplier=None, code=None, limit=20, offset=0, today=None):
+    """只读查询当前有效报价；规范品名空格和大小写，歧义品名先澄清，结果分页返回。"""
+    filters = {}
+    for name, value, size in (("product", product, 80), ("supplier", supplier, 80), ("code", code, 32)):
+        if value is not None:
+            if not isinstance(value, str) or not 0 < len(value.strip()) <= size:
+                raise InputError("查询条件须为有效的品名、供应商或报价编号。")
+            filters[name] = value.strip()
+    if not filters:
+        raise InputError("请提供要查询的品名、供应商或报价编号。")
+    if (type(limit) is not int or not 1 <= limit <= 50
+            or type(offset) is not int or not 0 <= offset <= 1000000):
+        raise InputError("每次可查询 1 至 50 条报价，起始位置须为有效的非负整数。")
+
+    today = today or timezone.localdate()
+    result = {"query": filters, "queried_at": timezone.now().isoformat(), "quotes": [],
+              "total": 0, "limit": limit, "offset": offset, "next_offset": None}
+    quotes = Quote.objects.filter(active=True)
+    if "product" in filters:
+        normalize = lambda value: re.sub(r"\s+", "", unicodedata.normalize("NFKC", value)).casefold()
+        products = list(quotes.order_by("product").values_list("product", flat=True).distinct())
+        needle = normalize(filters["product"])
+        matches = [p for p in products if normalize(p) == needle]
+        if not matches:
+            matches = [p for p in products if needle in normalize(p)]
+        if len(matches) != 1:
+            return {**result, "status": "ambiguous_product" if matches else "not_found",
+                    "matched_products": matches[:20], "matched_product_count": len(matches)}
+        quotes = quotes.filter(product=matches[0])
+        filters["product"] = matches[0]
+    if "supplier" in filters:
+        quotes = quotes.filter(supplier__icontains=filters["supplier"])
+    if "code" in filters:
+        quotes = quotes.filter(code__iexact=filters["code"])
+    total = quotes.count()
+    rows = [quote_data(q, today) for q in quotes.order_by("product", "unit_price", "code")[offset:offset + limit]]
+    return {**result, "status": "ok" if total else "not_found", "quotes": rows, "total": total,
+            "next_offset": offset + len(rows) if offset + len(rows) < total else None}
 
 
 def evaluate_quote(quote, needs, today):

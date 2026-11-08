@@ -11,7 +11,7 @@ from django.test import Client, TestCase
 from django.utils import timezone
 
 from .models import Draft, Inquiry, Quote
-from .pricing import evaluate_quote
+from .pricing import InputError, evaluate_quote, query_quotes
 
 
 class WorkflowTests(TestCase):
@@ -120,7 +120,7 @@ class WorkflowTests(TestCase):
             inquiry = self.sample()
         self.assertEqual(len(calls), 2)
         self.assertEqual([t["function"]["name"] for t in calls[0]["tools"]],
-                         ["find_quotes", "evaluate_quote", "list_products", "read_comparison"])
+                         ["find_quotes", "evaluate_quote", "list_products", "read_comparison", "query_quotes"])
         self.assertEqual(calls[1]["messages"][-1]["role"], "tool")
         self.assertIn("QT-1002", calls[1]["messages"][-1]["content"])
         self.assertEqual(inquiry["turns"][0]["recommended"], "QT-1002")
@@ -174,6 +174,126 @@ class WorkflowTests(TestCase):
         self.assertEqual(explained["needs"], quote["needs"])
         self.assertEqual(explained["comparison_revision"], quote["revision"])
         self.assertEqual(self.confirm(explained).status_code, 409)
+
+
+    def test_model_queries_another_product_and_refreshes_prices(self):
+        # 跨商品浏览当前报价不会覆盖采购条件；再次查询读取改价后的数据库。
+        inquiry = self.sample()
+        paper = Quote.objects.create(code="PAPER-01", supplier="演示纸业", product="A4打印纸",
+                                     unit_price="25.50", freight="30", stock=60, lead_days=2)
+        Quote.objects.create(code="PAPER-OFF", supplier="停用纸业", product="A4打印纸",
+                             unit_price="1", freight="0", stock=999, lead_days=1, active=False)
+        responses = [[("query_quotes", {"product": "a4 打印纸"})], "演示纸业的 A4打印纸单价25.50元，整单运费30元。",
+                     [("query_quotes", {"product": "A4打印纸"})], "当前单价已变为26.00元。"]
+        with simulated_provider(responses) as (base, calls), patch.dict("os.environ", {
+            "QUOTELINK_API_KEY": "local-test", "QUOTELINK_MODEL": "fixture", "QUOTELINK_BASE_URL": base
+        }):
+            first = self.ask("告诉我A4打印纸都有哪些厂商和报价", inquiry)
+            self.assertEqual(first.status_code, 200, first.content)
+            first = first.json()
+            paper.unit_price = "26.00"
+            paper.save(update_fields=["unit_price"])
+            refreshed = self.ask("再查一下A4打印纸现在的价格", first).json()
+        for item in (first, refreshed):
+            self.assertEqual(item["needs"], inquiry["needs"])
+            self.assertEqual(item["comparison_revision"], inquiry["comparison_revision"])
+            self.assertEqual(item["turns"][-1]["kind"], "answer")
+            self.assertFalse(item["turns"][-1]["rows"])
+        initial_payload = json.loads(calls[1]["messages"][-1]["content"])
+        latest_payload = json.loads(calls[3]["messages"][-1]["content"])
+        self.assertEqual(initial_payload["total"], 1)
+        self.assertEqual(initial_payload["query"]["product"], "A4打印纸")
+        self.assertEqual(initial_payload["quotes"][0]["unit_price"], "25.50")
+        self.assertEqual(latest_payload["quotes"][0]["unit_price"], "26.00")
+        self.assertEqual(refreshed["turns"][-1]["trace"][0]["tool"], "query_quotes")
+        self.assertNotIn("tools", calls[1])
+        self.assertEqual(self.confirm(refreshed).status_code, 201)
+
+    def test_model_supplier_query_without_procurement_conditions(self):
+        responses = [[("query_quotes", {"supplier": "青禾", "limit": 1})], "青禾数码当前有显示器报价，单价1160元。"]
+        with simulated_provider(responses) as (base, calls), patch.dict("os.environ", {
+            "QUOTELINK_API_KEY": "local-test", "QUOTELINK_MODEL": "fixture", "QUOTELINK_BASE_URL": base
+        }):
+            response = self.ask("青禾数码有哪些商品和报价？")
+        self.assertEqual(response.status_code, 200, response.content)
+        item = response.json()
+        self.assertEqual(item["needs"], {})
+        self.assertIsNone(item["comparison_revision"])
+        self.assertEqual(self.confirm(item).status_code, 400)
+        payload = json.loads(calls[1]["messages"][-1]["content"])
+        self.assertEqual(payload["quotes"][0]["code"], "QT-1002")
+
+    def test_model_unknown_product_does_not_use_old_comparison(self):
+        inquiry = self.sample()
+        responses = [[("query_quotes", {"product": "不存在的商品"})], "当前没有查到这个商品的有效报价。"]
+        with simulated_provider(responses) as (base, calls), patch.dict("os.environ", {
+            "QUOTELINK_API_KEY": "local-test", "QUOTELINK_MODEL": "fixture", "QUOTELINK_BASE_URL": base
+        }):
+            response = self.ask("不存在的商品有哪些报价？", inquiry)
+        self.assertEqual(response.status_code, 200, response.content)
+        payload = json.loads(calls[1]["messages"][-1]["content"])
+        self.assertEqual(payload["status"], "not_found")
+        self.assertFalse(payload["quotes"])
+        self.assertEqual(response.json()["needs"], inquiry["needs"])
+
+    def test_model_rejects_unexpected_query_fields_without_saving_turn(self):
+        responses = [[("query_quotes", {"supplier": "青禾", "sql": "select * from auth_user"})]]
+        with simulated_provider(responses) as (base, _), patch.dict("os.environ", {
+            "QUOTELINK_API_KEY": "local-test", "QUOTELINK_MODEL": "fixture", "QUOTELINK_BASE_URL": base
+        }):
+            response = self.ask("青禾数码有哪些报价？")
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(Inquiry.objects.exists())
+
+
+class QuoteQueryTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        # 同一商品的多家报价、相似品名与停用报价用于检验查询边界。
+        for code, supplier, product, price, active in [
+            ("PAPER-01", "演示甲纸业", "A4打印纸", "25.50", True),
+            ("PAPER-02", "演示乙纸业", "A4打印纸", "22.00", True),
+            ("PAPER-03", "演示丙纸业", "A4打印纸", "22.00", True),
+            ("A3-01", "演示甲纸业", "A3打印纸", "40.00", True),
+            ("OFF-01", "停用纸业", "A4打印纸", "1.00", False),
+        ]:
+            Quote.objects.create(code=code, supplier=supplier, product=product, unit_price=price,
+                                 freight="30", stock=60, lead_days=2, active=active)
+
+    def test_normalized_product_and_stable_pagination(self):
+        first = query_quotes(product=" ａ４ 打印纸 ", limit=2)
+        self.assertEqual(first["query"]["product"], "A4打印纸")
+        self.assertEqual(first["total"], 3)
+        self.assertEqual([q["code"] for q in first["quotes"]], ["PAPER-02", "PAPER-03"])
+        self.assertEqual(first["next_offset"], 2)
+        second = query_quotes(product="A4打印纸", limit=2, offset=2)
+        self.assertEqual([q["code"] for q in second["quotes"]], ["PAPER-01"])
+        self.assertIsNone(second["next_offset"])
+        self.assertEqual(set(second["quotes"][0]),
+                         {"code", "supplier", "product", "unit_price", "freight", "stock", "lead_days", "arrival"})
+
+    def test_ambiguous_and_missing_products(self):
+        ambiguous = query_quotes(product="打印纸")
+        self.assertEqual(ambiguous["status"], "ambiguous_product")
+        self.assertEqual(set(ambiguous["matched_products"]), {"A4打印纸", "A3打印纸"})
+        self.assertFalse(ambiguous["quotes"])
+        missing = query_quotes(product="A4打印纸' OR 1=1 --")
+        self.assertEqual(missing["status"], "not_found")
+        self.assertFalse(missing["quotes"])
+
+    def test_supplier_and_code_filters_are_combined(self):
+        supplier = query_quotes(supplier="甲纸业")
+        self.assertEqual(supplier["total"], 2)
+        exact = query_quotes(product="A4打印纸", supplier="甲", code="paper-01")
+        self.assertEqual(exact["total"], 1)
+        self.assertEqual(exact["quotes"][0]["code"], "PAPER-01")
+        self.assertEqual(query_quotes(supplier="乙", code="paper-01")["status"], "not_found")
+
+    def test_query_rejects_empty_filters_and_unbounded_results(self):
+        for args in ({}, {"product": " "}, {"supplier": "甲", "limit": 51},
+                     {"code": "PAPER-01", "offset": -1}, {"code": "PAPER-01", "limit": True}):
+            with self.subTest(args=args), self.assertRaises(InputError):
+                query_quotes(**args)
 
 
 @contextmanager

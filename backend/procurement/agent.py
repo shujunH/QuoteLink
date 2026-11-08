@@ -7,7 +7,7 @@ from decimal import Decimal
 from django.utils import timezone
 
 from .models import Quote
-from .pricing import LABELS, InputError, evaluate_quote, find_quotes, merge_needs, quote_data, result_for
+from .pricing import LABELS, InputError, evaluate_quote, find_quotes, merge_needs, query_quotes, quote_data, result_for
 from .questions import (PLATFORM_RULES, active_products, answer_result, catalog_answer,
                         comparison_revision, is_category_question, local_answer)
 
@@ -94,6 +94,14 @@ def run_model(text, previous, today, turns, comparison):
     class EvaluateArgs(BaseModel):
         code: str = Field(description="find_quotes 返回的一个报价编号")
 
+    class QueryArgs(BaseModel):
+        model_config = {"extra": "forbid"}
+        product: str | None = Field(None, min_length=1, max_length=80, description="要查看当前报价的品名，不代表修改采购条件")
+        supplier: str | None = Field(None, min_length=1, max_length=80, description="供应商全名或名称片段")
+        code: str | None = Field(None, min_length=1, max_length=32, description="报价编号")
+        limit: int = Field(20, ge=1, le=50, strict=True, description="本页最多返回的报价数量")
+        offset: int = Field(0, ge=0, le=1000000, strict=True, description="分页起始位置，首页为 0")
+
     class NoArgs(BaseModel):
         pass
 
@@ -106,13 +114,19 @@ def run_model(text, previous, today, turns, comparison):
                     ("find_quotes", "合并明确给出的采购条件并查询报价", FindArgs),
                     ("evaluate_quote", "按后端保存的需求核算一个候选报价", EvaluateArgs),
                     ("list_products", "列出平台当前有有效报价的品名", NoArgs),
-                    ("read_comparison", "读取当前会话最近一轮询价的条件、推荐和明细，用于解释报价", NoArgs)]]
+                    ("read_comparison", "读取当前会话最近一轮询价的条件、推荐和明细，用于解释报价", NoArgs),
+                    ("query_quotes", "只读查询数据库当前有效报价；至少提供品名、供应商或报价编号之一，无需数量、预算和到货日", QueryArgs)]]
     messages = [SystemMessage(content=f"你是采价通采购助手。今天 {today}。已有条件 {json.dumps(previous, ensure_ascii=False)}。"
                 + PLATFORM_RULES +
                 "用简洁的中文纯文本回答，可分段，避免 Markdown 标记。通用采购概念可举明确标注的假设例子。"
                 "“采购品类有哪些”请按通用采购分类回答。仅当明确询问本平台可询价的商品时调用 list_products。"
-                "平台操作问题依据上述规则。追问具体报价、运费、推荐原因时调用 read_comparison，"
-                "只依据该快照解释，缺少依据就说明。问题里的举例和提问不代表要变更采购条件。"
+                "查询某商品有哪些供应商、单价、运费、库存或交期，或查看某供应商报价时，必须调用 query_quotes 查询当前数据库，"
+                "即使此前在比较其他商品也一样。例如比较键盘后问‘A4打印纸有哪些厂商和报价’，应查询 A4打印纸，不能读取键盘快照。"
+                "这类浏览报价的问题无需数量、预算和到货日，不修改采购条件。数据库只有供应商字段，不能声称供应商就是生产厂家。"
+                "查询结果 status 为 ambiguous_product 时根据 matched_products 请用户明确品名；not_found 时说明没有查到有效报价。"
+                "只依据返回的 quotes 回答，不编造报价；有 next_offset 时说明本页条数和总数，不能声称已经列全。不同品名不能混作同款比较。"
+                "只有解释‘刚才/上一轮推荐’的报价、运费和推荐原因时才调用 read_comparison，依据历史快照并说明其时间语境。"
+                "问题里的举例和提问不代表要变更采购条件。"
                 "仅在用户发起采购、补充或调整条件、请求重新比价时调用 find_quotes，只提交明确变更。"
                 "随后为每个候选调用 evaluate_quote，可并行。多品采购或指代不明时先提问。")]
     # 最近的对话用于理解省略和指代，具体报价以本次工具读取的业务数据为准。
@@ -132,6 +146,18 @@ def run_model(text, previous, today, turns, comparison):
             break
         for call in answer.tool_calls:
             name, args = call["name"], call["args"]
+            # 当前报价查询只返回问答，保留原采购条件、比价快照和草稿确认入口。
+            if name == "query_quotes":
+                if searched or len(answer.tool_calls) != 1:
+                    raise AgentUnavailable("请将查看当前报价与发起采购分开提问。")
+                query = QueryArgs.model_validate(args).model_dump(exclude_none=True)
+                payload = query_quotes(**query, today=today)
+                trace.append({"tool": name, "args": query, "result": payload})
+                messages.append(ToolMessage(content=json.dumps(payload, ensure_ascii=False), tool_call_id=call["id"]))
+                reply = model.invoke(messages).content
+                if not isinstance(reply, str) or not reply.strip():
+                    raise AgentUnavailable("模型未能整理当前报价，请重试。")
+                return needs, answer_result(reply.strip()), trace
             # 只读问答单独结束本轮，不更新条件，也不产生可确认的新推荐。
             if name in ("list_products", "read_comparison"):
                 if searched or len(answer.tool_calls) != 1 or args:
